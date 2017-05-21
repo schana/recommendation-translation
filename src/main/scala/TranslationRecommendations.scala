@@ -2,20 +2,28 @@ import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.feature.{LabeledPoint, VectorIndexer}
 import org.apache.spark.ml.linalg.DenseVector
-import org.apache.spark.ml.regression.{RandomForestRegressionModel, RandomForestRegressor}
+import org.apache.spark.ml.regression.RandomForestRegressor
 import org.apache.spark.sql.SparkSession
 
 import scala.util.Random
 
 object TranslationRecommendations {
-  case class Features(sitelinkCount: Int)
+  case class Features(sitelinkCount: Int, recentPageviews: Int)
 
   def getFeatures(wikidataId: Int): Features = {
-    Features(Random.nextInt(300))
+    Features(Random.nextInt(300), Random.nextInt(10000))
   }
 
-  def getFeatureVector(features: Features): Array[Double] = {
-    Array(getPredictedRank(features), features.sitelinkCount.toDouble)
+  def getLabeled(rankedFeature: (Features, Long)): LabeledPoint = {
+    val (features, rank) = rankedFeature
+    LabeledPoint(rank.toDouble, getFeatureVector(features))
+  }
+
+  def getFeatureVector(features: Features): DenseVector = {
+    new DenseVector(Array(
+      features.sitelinkCount.toDouble,
+      features.recentPageviews.toDouble
+    ))
   }
 
   def getPredictedRank(features: Features): Double = {
@@ -29,14 +37,17 @@ object TranslationRecommendations {
       .master("local")
       .getOrCreate()
 
-//    val wikidataIds = Array("Q89", "Q90", "Q91", "Q92")
-    val wikidataIds = Array.fill(1000)(Random.nextInt)
+    // Get features for a list of wikidata ids
+    val wikidataIds = (80 to 500).toArray
     val ids = spark.sparkContext.parallelize(wikidataIds)
-    val features = ids.map(getFeatures)
-    val featureVectors = features.map(getFeatureVector)
+    val featuresList = ids.map(getFeatures)
 
-    val labeled = featureVectors.map(vector => LabeledPoint(vector(0), new DenseVector(vector.drop(1))))
+    // Get the rank based on sorting by pageviews
+    val sortedFeatures = featuresList.sortBy(features => features.recentPageviews, ascending = false)
+    val rankedFeatures = sortedFeatures.zipWithIndex()
 
+    // Massage the data to be in a format used by machine learning library
+    val labeled = rankedFeatures.map(getLabeled)
     val dataFrame = spark.createDataFrame(labeled).toDF("label", "features")
 
     val featureIndexer = new VectorIndexer()
@@ -47,11 +58,11 @@ object TranslationRecommendations {
 
     val Array(trainingData, testData) = dataFrame.randomSplit(Array(0.7, 0.3))
 
-    val rf = new RandomForestRegressor()
+    val regressor = new RandomForestRegressor()
       .setLabelCol("label")
       .setFeaturesCol("indexedFeatures")
 
-    val pipeline = new Pipeline().setStages(Array(featureIndexer, rf))
+    val pipeline = new Pipeline().setStages(Array(featureIndexer, regressor))
     val model = pipeline.fit(trainingData)
     val predictions = model.transform(testData)
 
@@ -64,10 +75,10 @@ object TranslationRecommendations {
     val rmse = evaluator.evaluate(predictions)
     println("Root Mean Squared Error (RMSE) on test data = " + rmse)
 
-    val rfModel = model.stages(1).asInstanceOf[RandomForestRegressionModel]
+//    val rfModel = model.stages(1).asInstanceOf[RandomForestRegressionModel]
 //    println("Learned regression forest model:\n" + rfModel.toDebugString)
 
-    val collected = labeled.collect()
+//    val collected = labeled.collect()
 //    println(collected.deep.mkString("\n"))
     spark.stop()
   }
