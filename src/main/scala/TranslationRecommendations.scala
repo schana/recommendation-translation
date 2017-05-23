@@ -3,64 +3,36 @@ import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.feature.{LabeledPoint, VectorIndexer}
 import org.apache.spark.ml.linalg.DenseVector
 import org.apache.spark.ml.regression.RandomForestRegressor
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{DataFrame, SparkSession}
 
 import scala.util.Random
 
 object TranslationRecommendations {
+  case class WikidataItem(id: Int, sitelinks: Array[String])
   case class Features(sitelinkCount: Int, recentPageviews: Int)
 
-  def getFeatures(wikidataId: Int): Features = {
-    Features(Random.nextInt(300), Random.nextInt(10000))
-  }
-
-  def getLabeled(rankedFeature: (Features, Long)): LabeledPoint = {
-    val (features, rank) = rankedFeature
-    LabeledPoint(rank.toDouble, getFeatureVector(features))
-  }
-
-  def getFeatureVector(features: Features): DenseVector = {
-    new DenseVector(Array(
-      features.sitelinkCount.toDouble,
-      features.recentPageviews.toDouble
-    ))
-  }
-
-  def getPredictedRank(features: Features): Double = {
-    features.sitelinkCount.toDouble / 300.0
-  }
-
   def main(args: Array[String]): Unit = {
-    val spark = SparkSession
-      .builder()
-      .appName("TranslationRecommendations")
-      .master("local")
-      .getOrCreate()
+    val spark = initializeSpark()
 
-    // Get features for a list of wikidata ids
-    val wikidataIds = (80 to 500).toArray
-    val ids = spark.sparkContext.parallelize(wikidataIds)
-    val featuresList = ids.map(getFeatures)
+    val wikidataItems = getWikidataItems(spark)
+    val features = wikidataItems.map(getFeatures)
+    val rankedFeatures = rankFeatures(features)
 
-    // Get the rank based on sorting by pageviews
-    val sortedFeatures = featuresList.sortBy(features => features.recentPageviews, ascending = false)
-    val rankedFeatures = sortedFeatures.zipWithIndex()
-
-    // Massage the data to be in a format used by machine learning library
-    val labeled = rankedFeatures.map(getLabeled)
-    val dataFrame = spark.createDataFrame(labeled).toDF("label", "features")
+    val data = prepareDataFrame(spark, rankedFeatures)
 
     val featureIndexer = new VectorIndexer()
       .setInputCol("features")
       .setOutputCol("indexedFeatures")
       .setMaxCategories(2)
-      .fit(dataFrame)
+      .fit(data)
 
-    val Array(trainingData, testData) = dataFrame.randomSplit(Array(0.7, 0.3))
+    val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
 
     val regressor = new RandomForestRegressor()
       .setLabelCol("label")
       .setFeaturesCol("indexedFeatures")
+      .setNumTrees(50)
 
     val pipeline = new Pipeline().setStages(Array(featureIndexer, regressor))
     val model = pipeline.fit(trainingData)
@@ -75,11 +47,62 @@ object TranslationRecommendations {
     val rmse = evaluator.evaluate(predictions)
     println("Root Mean Squared Error (RMSE) on test data = " + rmse)
 
-//    val rfModel = model.stages(1).asInstanceOf[RandomForestRegressionModel]
-//    println("Learned regression forest model:\n" + rfModel.toDebugString)
-
-//    val collected = labeled.collect()
-//    println(collected.deep.mkString("\n"))
     spark.stop()
+  }
+
+  def initializeSpark(): SparkSession = {
+    SparkSession
+      .builder()
+      .appName("TranslationRecommendations")
+      .master("local")
+      .getOrCreate()
+  }
+
+  def getWikidataItems(spark: SparkSession): RDD[WikidataItem] = {
+    val wikidataIds = (80 to 200).toArray
+    val ids = spark.sparkContext.parallelize(wikidataIds)
+    ids.map(id => WikidataItem(id, getSitelinks(id)))
+  }
+
+  def getSitelinks(wikidataId: Int): Array[String] = {
+    Array("en", "de")
+  }
+
+  def getFeatures(wikidataItem: WikidataItem): Features = {
+    Features(
+      sitelinkCount=wikidataItem.sitelinks.length,
+      recentPageviews=Random.nextInt(10000)
+    )
+  }
+
+  def rankFeatures(features: RDD[Features]): RDD[(Features, Double)] = {
+    // Sort by pageviews
+    val sortedFeatures = features.sortBy(featuresInstance => featuresInstance.recentPageviews, ascending = false)
+    val rankedFeatures = sortedFeatures.zipWithIndex()
+    // Normalize rank
+    val count = rankedFeatures.count()
+    rankedFeatures.map(f => normalizeRankedFeatures(f, count))
+  }
+
+  def normalizeRankedFeatures(rankedFeatures: (Features, Long), rankCount: Long): (Features, Double) = {
+    val (features, rank) = rankedFeatures
+    (features, rank.toDouble / rankCount.toDouble)
+  }
+
+  def prepareDataFrame(spark: SparkSession, rankedFeatures: RDD[(Features, Double)]): DataFrame = {
+    val labeled = rankedFeatures.map(getLabeled)
+    spark.createDataFrame(labeled).toDF("label", "features")
+  }
+
+  def getLabeled(rankedFeature: (Features, Double)): LabeledPoint = {
+    val (features, rank) = rankedFeature
+    LabeledPoint(rank, getFeatureVector(features))
+  }
+
+  def getFeatureVector(features: Features): DenseVector = {
+    new DenseVector(Array(
+      features.sitelinkCount.toDouble,
+      features.recentPageviews.toDouble
+    ))
   }
 }
