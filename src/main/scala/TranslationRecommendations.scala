@@ -8,15 +8,26 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 
 import scala.util.Random
 
+case class SitelinkPageviewsEntry(wikidataId: String, site: String, title: String, pageviews: Int)
+case class AggregateSitelinkPageviews(wikidataId: String, sitelinkCount: Int, pageviews: Int)
+case class WikidataItem(id: Int, sitelinks: Array[String])
+case class Features(sitelinkCount: Int, recentPageviews: Int)
+
 object TranslationRecommendations {
-  case class WikidataItem(id: Int, sitelinks: Array[String])
-  case class Features(sitelinkCount: Int, recentPageviews: Int)
 
   def main(args: Array[String]): Unit = {
     val spark = initializeSpark()
 
-    val wikidataItems = getWikidataItems(spark)
-    val features = wikidataItems.map(getFeatures)
+    val sitelinkPageviews = getSitelinkPageviews(spark).persist()
+    val preReduce = sitelinkPageviews.map(sitelinkPageviewsEntry => AggregateSitelinkPageviews(
+      sitelinkPageviewsEntry.wikidataId, 1, sitelinkPageviewsEntry.pageviews))
+
+    val grouped = preReduce.keyBy(item => item.wikidataId)
+    val aggregateSitelinkPageviews = grouped.reduceByKey((a, b) => AggregateSitelinkPageviews(a.wikidataId, a.sitelinkCount + b.sitelinkCount, a.pageviews + b.pageviews))
+    val features = aggregateSitelinkPageviews.map(item => Features(item._2.sitelinkCount, item._2.pageviews))
+
+//    val wikidataItems = getWikidataItems(spark)
+//    val features = wikidataItems.map(getFeatures)
     val rankedFeatures = rankFeatures(features)
 
     val data = prepareDataFrame(spark, rankedFeatures)
@@ -56,6 +67,16 @@ object TranslationRecommendations {
       .appName("TranslationRecommendations")
       .master("local")
       .getOrCreate()
+  }
+
+  def getSitelinkPageviews(spark: SparkSession): RDD[SitelinkPageviewsEntry] = {
+    spark.read
+      .format("csv")
+      .option("header", "true")
+      .option("mode", "DROPMALFORMED")
+      .csv("sitelink-pageviews.csv")
+      .rdd
+      .map(row => SitelinkPageviewsEntry(row.getString(1), row.getString(2), row.getString(3), row.getString(4).toInt))
   }
 
   def getWikidataItems(spark: SparkSession): RDD[WikidataItem] = {
