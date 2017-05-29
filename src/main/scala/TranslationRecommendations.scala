@@ -1,38 +1,35 @@
-import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.linalg.DenseVector
 import org.apache.spark.ml.regression.RandomForestRegressor
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 
-case class SitelinkPageviewsEntry(wikidataId: String, site: String, title: String, pageviews: Int)
-case class AggregateSitelinkPageviews(wikidataId: String, sitelinkCount: Int, pageviews: Int)
-case class Features(wikidataId: String, sitelinkCount: Int, recentPageviews: Int)
+case class SitelinkPageviewsEntry(id: String, site: String, title: String, pageviews: Double)
+
+case class RankedEntry(id: String, site: String, title: String, pageviews: Double, rank: Double)
 
 object TranslationRecommendations {
   val FEATURES = "features"
-  val INDEXED_FEATURES = "indexedFeatures"
   val LABEL = "label"
   val PREDICTION = "prediction"
+  val INPUT_FILE = "lite-sitelinks-pagecounts.tsv"
 
   def main(args: Array[String]): Unit = {
     val spark = initializeSpark()
 
-    val sitelinkPageviewsEntries = getSitelinkPageviewsEntries(spark).persist()
-    val data = transformEntriesToFeatures(spark, sitelinkPageviewsEntries)
+    val data = getData(spark, "enwiki")
 
     val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
 
     val regressor = new RandomForestRegressor()
       .setLabelCol(LABEL)
       .setFeaturesCol(FEATURES)
-      .setNumTrees(50)
 
-    val pipeline = new Pipeline().setStages(Array(regressor))
-    val model = pipeline.fit(trainingData)
+    val model = regressor.fit(trainingData)
     val predictions = model.transform(testData)
 
-    predictions.show(500)
+    predictions.show(5)
 
     val evaluator = new RegressionEvaluator()
       .setLabelCol(LABEL)
@@ -45,60 +42,85 @@ object TranslationRecommendations {
   }
 
   def initializeSpark(): SparkSession = {
-    SparkSession
+    val spark = SparkSession
       .builder()
       .appName("TranslationRecommendations")
       .master("local")
       .getOrCreate()
+    spark.sparkContext.setCheckpointDir(".")
+    spark.sparkContext.setLogLevel("WARN")
+    spark
   }
 
-  def getSitelinkPageviewsEntries(spark: SparkSession): RDD[SitelinkPageviewsEntry] = {
+  def getData(spark: SparkSession, target: String): DataFrame = {
+    val sitelinkPageviewsEntries = getSitelinkPageviewsEntries(spark)
+    val data = transformEntriesToFeatures(spark, sitelinkPageviewsEntries.rdd)
+    val workData = data.filter(row => row(row.fieldIndex("exists_" + target)) == 1.0)
+
+    import spark.implicits._
+    val labeledData = workData.map(row =>
+      (
+        row.getString(row.fieldIndex("id")),
+        row.getDouble(row.fieldIndex("rank_" + target)),
+        new DenseVector(
+          ((1 until row.fieldIndex("rank_" + target)).map(row.getDouble) ++
+            (row.fieldIndex("rank_" + target) + 1 until row.length).map(row.getDouble)).toArray
+        )
+      )
+    ).rdd
+    labeledData.checkpoint()
+
+    spark.createDataFrame(labeledData).toDF("id", LABEL, FEATURES)
+  }
+
+  def getSitelinkPageviewsEntries(spark: SparkSession): Dataset[SitelinkPageviewsEntry] = {
+    import spark.implicits._
     spark.read
       .format("csv")
       .option("header", "true")
+      .option("inferSchema", "true")
       .option("mode", "DROPMALFORMED")
-      .csv("lite-sitelink-pageviews.csv")
-      .rdd
-      .map(row => SitelinkPageviewsEntry(row.getString(1), row.getString(2), row.getString(3), row.getString(4).toInt))
+      .option("sep", "\t")
+      .csv(INPUT_FILE)
+      .as[SitelinkPageviewsEntry]
   }
 
   def transformEntriesToFeatures(spark: SparkSession, entries: RDD[SitelinkPageviewsEntry]): DataFrame = {
-    val preReduce = entries.map(sitelinkPageviewsEntry => AggregateSitelinkPageviews(
-      sitelinkPageviewsEntry.wikidataId, 1, sitelinkPageviewsEntry.pageviews))
+    val sites = entries.map(_.site).distinct.collect.sorted
 
-    val grouped = preReduce.keyBy(item => item.wikidataId)
-    val aggregateSitelinkPageviews = grouped.reduceByKey((a, b) =>
-      AggregateSitelinkPageviews(a.wikidataId, a.sitelinkCount + b.sitelinkCount, a.pageviews + b.pageviews))
-    val features = aggregateSitelinkPageviews.map(item => Features(item._1, item._2.sitelinkCount, item._2.pageviews))
+    val groupedSites = entries.groupBy(_.site).collect()
+    val rankedEntries = groupedSites.map { case (site, items) => rank(spark, items) }
+      .fold(spark.sparkContext.emptyRDD)((a, b) => a ++ b)
 
-    val rankedFeatures = rankFeatures(features)
+    val groupedEntries = rankedEntries.groupBy(_.id)
+    val itemMaps = groupedEntries.map { case (id, itemEntries) =>
+      id -> itemEntries.map(entry => entry.site -> (entry.pageviews, entry.rank)).toMap
+    }
 
-    prepareDataFrame(spark, rankedFeatures)
+    val structure =
+      StructType(
+        Array(StructField("id", StringType, nullable = false)) ++
+          sites.map(site => StructField("pageviews_" + site, DoubleType, nullable = false)) ++
+          sites.map(site => StructField("rank_" + site, DoubleType, nullable = false)) ++
+          sites.map(site => StructField("exists_" + site, DoubleType, nullable = false))
+      )
+    val rows = itemMaps.map { case (id, itemMap) =>
+      Row.fromSeq(Array(id) ++
+        sites.map(itemMap.getOrElse(_, (0.0, 0.0))._1) ++ // pageviews
+        sites.map(itemMap.getOrElse(_, (0.0, 0.0))._2) ++ // rank
+        sites.map(site => if (itemMap.contains(site)) 1.0 else 0.0) // exists
+      )
+    }
+
+    spark.createDataFrame(rows, structure)
   }
 
-  def rankFeatures(features: RDD[Features]): RDD[(Features, Double)] = {
-    // Sort by pageviews
-    val sortedFeatures = features.sortBy(featuresInstance => featuresInstance.recentPageviews, ascending = false)
-    val rankedFeatures = sortedFeatures.zipWithIndex()
-    // Normalize rank
-    val count = rankedFeatures.count()
-    rankedFeatures.map(f => normalizeRankedFeatures(f, count))
-  }
-
-  def normalizeRankedFeatures(rankedFeatures: (Features, Long), rankCount: Long): (Features, Double) = {
-    val (features, rank) = rankedFeatures
-    (features, rank.toDouble / rankCount.toDouble)
-  }
-
-  def prepareDataFrame(spark: SparkSession, rankedFeatures: RDD[(Features, Double)]): DataFrame = {
-    val labeled = rankedFeatures.map{case (features, rank) => (features.wikidataId, rank, getFeatureVector(features))}
-    spark.createDataFrame(labeled).toDF("id", LABEL, FEATURES)
-  }
-
-  def getFeatureVector(features: Features): DenseVector = {
-    new DenseVector(Array(
-      features.sitelinkCount.toDouble,
-      features.recentPageviews.toDouble
-    ))
+  def rank(spark: SparkSession, items: Iterable[SitelinkPageviewsEntry]): RDD[RankedEntry] = {
+    val entries = spark.sparkContext.parallelize(items.toSeq)
+    val ranked = entries.sortBy(_.pageviews).zipWithIndex()
+    val count = ranked.count() - 1
+    ranked.map { case (item, rank) =>
+      RankedEntry(item.id, item.site, item.title, item.pageviews, rank.toDouble / count.toDouble)
+    }
   }
 }
