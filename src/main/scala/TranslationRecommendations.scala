@@ -2,7 +2,7 @@ import scala.math.Ordered.orderingToOrdered
 import org.apache.spark.Partitioner
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.linalg.DenseVector
-import org.apache.spark.ml.regression.RandomForestRegressor
+import org.apache.spark.ml.regression.{RandomForestRegressionModel, RandomForestRegressor}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 import org.apache.spark.sql._
@@ -16,14 +16,15 @@ object TranslationRecommendations {
   val LABEL = "label"
   val PREDICTION = "prediction"
   val INPUT_FILE = "sitelinks-pagecounts.tsv"
-  val BUILD_DATA = true
+  val BUILD_DATA = false
+  val BUILD_MODEL = false
   val EXISTS = 1.0
   val NOT_EXISTS = 0.0
 
   def main(args: Array[String]): Unit = {
     val spark: SparkSession = initializeSpark()
 
-    val data: DataFrame = if (BUILD_DATA) getData(spark) else getData(spark, "./data")
+    val data: DataFrame = if (BUILD_DATA) getData(spark) else spark.read.load("./data")
     val workData: DataFrame = getWorkData(spark, data, "enwiki")
 
     val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
@@ -32,7 +33,7 @@ object TranslationRecommendations {
       .setLabelCol(LABEL)
       .setFeaturesCol(FEATURES)
 
-    val model = regressor.fit(trainingData)
+    val model = if (BUILD_MODEL) regressor.fit(trainingData) else RandomForestRegressionModel.load("./model")
     val predictions = model.transform(testData)
 
     predictions.show(5)
@@ -47,7 +48,9 @@ object TranslationRecommendations {
     if (BUILD_DATA) {
       data.write.mode(SaveMode.Overwrite).save("./data")
     }
-    model.write.overwrite().save("./model")
+    if (BUILD_MODEL) {
+      model.write.overwrite().save("./model")
+    }
 
     spark.stop()
   }
@@ -60,10 +63,6 @@ object TranslationRecommendations {
       .getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     spark
-  }
-
-  def getData(spark: SparkSession, path: String): DataFrame = {
-    spark.read.load(path)
   }
 
   def getData(spark: SparkSession): DataFrame = {
