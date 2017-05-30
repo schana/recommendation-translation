@@ -1,9 +1,11 @@
+import scala.math.Ordered.orderingToOrdered
+import org.apache.spark.Partitioner
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.linalg.DenseVector
 import org.apache.spark.ml.regression.RandomForestRegressor
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
-import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
+import org.apache.spark.sql._
 
 case class SitelinkPageviewsEntry(id: String, site: String, title: String, pageviews: Double)
 
@@ -13,14 +15,18 @@ object TranslationRecommendations {
   val FEATURES = "features"
   val LABEL = "label"
   val PREDICTION = "prediction"
-  val INPUT_FILE = "lite-sitelinks-pagecounts.tsv"
+  val INPUT_FILE = "sitelinks-pagecounts.tsv"
+  val BUILD_DATA = true
+  val EXISTS = 1.0
+  val NOT_EXISTS = 0.0
 
   def main(args: Array[String]): Unit = {
-    val spark = initializeSpark()
+    val spark: SparkSession = initializeSpark()
 
-    val data = getData(spark, "enwiki")
+    val data: DataFrame = if (BUILD_DATA) getData(spark) else getData(spark, "./data")
+    val workData: DataFrame = getWorkData(spark, data, "enwiki")
 
-    val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
+    val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
 
     val regressor = new RandomForestRegressor()
       .setLabelCol(LABEL)
@@ -38,6 +44,11 @@ object TranslationRecommendations {
     val rmse = evaluator.evaluate(predictions)
     println("Root Mean Squared Error (RMSE) on test data = " + rmse)
 
+    if (BUILD_DATA) {
+      data.write.mode(SaveMode.Overwrite).save("./data")
+    }
+    model.write.overwrite().save("./model")
+
     spark.stop()
   }
 
@@ -45,30 +56,36 @@ object TranslationRecommendations {
     val spark = SparkSession
       .builder()
       .appName("TranslationRecommendations")
-      .master("local")
+      .master("local[*]")
       .getOrCreate()
-    spark.sparkContext.setCheckpointDir(".")
     spark.sparkContext.setLogLevel("WARN")
     spark
   }
 
-  def getData(spark: SparkSession, target: String): DataFrame = {
-    val sitelinkPageviewsEntries = getSitelinkPageviewsEntries(spark)
-    val data = transformEntriesToFeatures(spark, sitelinkPageviewsEntries.rdd)
-    val workData = data.filter(row => row(row.fieldIndex("exists_" + target)) == 1.0)
+  def getData(spark: SparkSession, path: String): DataFrame = {
+    spark.read.load(path)
+  }
+
+  def getData(spark: SparkSession): DataFrame = {
+    val sitelinkPageviewsEntries: Dataset[SitelinkPageviewsEntry] = getSitelinkPageviewsEntries(spark)
+    transformEntriesToFeatures(spark, sitelinkPageviewsEntries.rdd)
+  }
+
+  def getWorkData(spark: SparkSession, data: DataFrame, target: String): DataFrame = {
+    val workData: DataFrame = data.filter(row => row(row.fieldIndex("exists_" + target)) == EXISTS)
 
     import spark.implicits._
     val labeledData = workData.map(row =>
       (
         row.getString(row.fieldIndex("id")),
         row.getDouble(row.fieldIndex("rank_" + target)),
-        new DenseVector(
-          ((1 until row.fieldIndex("rank_" + target)).map(row.getDouble) ++
-            (row.fieldIndex("rank_" + target) + 1 until row.length).map(row.getDouble)).toArray
-        )
+        /* Include everything except the target language's features */
+        new DenseVector((
+          (1 until row.fieldIndex("pageviews_" + target)).map(row.getDouble) ++
+            (row.fieldIndex("exists_" + target) + 1 until row.length).map(row.getDouble)
+          ).toArray)
       )
     ).rdd
-    labeledData.checkpoint()
 
     spark.createDataFrame(labeledData).toDF("id", LABEL, FEATURES)
   }
@@ -85,42 +102,74 @@ object TranslationRecommendations {
       .as[SitelinkPageviewsEntry]
   }
 
+  case class PartitionKey(site: String, pageviews: Double) extends Ordered[PartitionKey] {
+    override def compare(that: PartitionKey): Int =
+      (this.site, this.pageviews) compare(that.site, that.pageviews)
+  }
+
+  class SitePartitioner[K <: PartitionKey](val numPartitions: Int)
+    extends Partitioner {
+    require(numPartitions >= 0,
+      s"Number of partitions ($numPartitions) cannot be negative.")
+
+    override def getPartition(key: Any): Int = {
+      math.abs(key.asInstanceOf[K].site.hashCode()) % numPartitions
+    }
+  }
+
   def transformEntriesToFeatures(spark: SparkSession, entries: RDD[SitelinkPageviewsEntry]): DataFrame = {
-    val sites = entries.map(_.site).distinct.collect.sorted
+    val sitesEntryCount = entries.map(_.site).countByValue()
+    val sites = sitesEntryCount.toVector.map(_._1).sorted
 
-    val groupedSites = entries.groupBy(_.site).collect()
-    val rankedEntries = groupedSites.map { case (site, items) => rank(spark, items) }
-      .fold(spark.sparkContext.emptyRDD)((a, b) => a ++ b)
+    val partitioner = new SitePartitioner(16)
+    val sortedGroupedEntries: RDD[(PartitionKey, (String, String))] = entries
+      .map(e => (PartitionKey(e.site, e.pageviews), (e.id, e.title)))
+      .repartitionAndSortWithinPartitions(partitioner)
 
-    val groupedEntries = rankedEntries.groupBy(_.id)
-    val itemMaps = groupedEntries.map { case (id, itemEntries) =>
+    val rankedEntries = sortedGroupedEntries
+      .mapPartitions((part: Iterator[(PartitionKey, (String, String))]) => {
+        var currentSite: Option[String] = None
+        var currentSiteEntryCount: Option[Double] = None
+        var rank: Long = 0L
+        part.map { case (key, (id, title)) => {
+          if (currentSite.getOrElse(Nil) != key.site) {
+            /* Initialize for site */
+            rank = 0L
+            currentSite = Some(key.site)
+            currentSiteEntryCount = Some(sitesEntryCount(key.site).toDouble)
+          }
+          rank = rank + 1
+          RankedEntry(id, key.site, title, key.pageviews, rank.toDouble / currentSiteEntryCount.get)
+        }
+        }
+      })
+
+    /*
+     * Now that all entries have been ranked, combine the results into vectors grouped by id
+    */
+    val groupedEntries: RDD[(String, Iterable[RankedEntry])] = rankedEntries.groupBy(_.id)
+    val itemMaps: RDD[(String, Map[String, (Double, Double)])] = groupedEntries.map { case (id, itemEntries) =>
       id -> itemEntries.map(entry => entry.site -> (entry.pageviews, entry.rank)).toMap
     }
 
-    val structure =
-      StructType(
-        Array(StructField("id", StringType, nullable = false)) ++
-          sites.map(site => StructField("pageviews_" + site, DoubleType, nullable = false)) ++
-          sites.map(site => StructField("rank_" + site, DoubleType, nullable = false)) ++
-          sites.map(site => StructField("exists_" + site, DoubleType, nullable = false))
-      )
+    val structure = StructType(
+      Array(StructField("id", StringType, nullable = false)) ++
+        sites.flatMap(site => Seq(
+          StructField("pageviews_" + site, DoubleType, nullable = false),
+          StructField("rank_" + site, DoubleType, nullable = false),
+          StructField("exists_" + site, DoubleType, nullable = false)
+        )))
+
     val rows = itemMaps.map { case (id, itemMap) =>
       Row.fromSeq(Array(id) ++
-        sites.map(itemMap.getOrElse(_, (0.0, 0.0))._1) ++ // pageviews
-        sites.map(itemMap.getOrElse(_, (0.0, 0.0))._2) ++ // rank
-        sites.map(site => if (itemMap.contains(site)) 1.0 else 0.0) // exists
+        sites.flatMap(site => Seq(
+          itemMap.getOrElse(site, (0.0, 0.0))._1, /* pageviews */
+          itemMap.getOrElse(site, (0.0, 0.0))._2, /* rank */
+          if (itemMap.contains(site)) EXISTS else NOT_EXISTS /* exists */
+        ))
       )
     }
 
     spark.createDataFrame(rows, structure)
-  }
-
-  def rank(spark: SparkSession, items: Iterable[SitelinkPageviewsEntry]): RDD[RankedEntry] = {
-    val entries = spark.sparkContext.parallelize(items.toSeq)
-    val ranked = entries.sortBy(_.pageviews).zipWithIndex()
-    val count = ranked.count() - 1
-    ranked.map { case (item, rank) =>
-      RankedEntry(item.id, item.site, item.title, item.pageviews, rank.toDouble / count.toDouble)
-    }
   }
 }
