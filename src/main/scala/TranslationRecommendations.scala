@@ -1,3 +1,5 @@
+import java.io.File
+
 import scala.math.Ordered.orderingToOrdered
 import org.apache.spark.Partitioner
 import org.apache.spark.ml.evaluation.RegressionEvaluator
@@ -6,6 +8,7 @@ import org.apache.spark.ml.regression.{RandomForestRegressionModel, RandomForest
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 import org.apache.spark.sql._
+import scopt.OptionParser
 
 case class SitelinkPageviewsEntry(id: String, site: String, title: String, pageviews: Double)
 
@@ -15,59 +18,133 @@ object TranslationRecommendations {
   val FEATURES = "features"
   val LABEL = "label"
   val PREDICTION = "prediction"
-  val INPUT_FILE = "sitelinks-pagecounts.tsv"
-  val BUILD_DATA = false
-  val BUILD_MODEL = false
   val EXISTS = 1.0
   val NOT_EXISTS = 0.0
 
+  case class Params(rawData: Option[File] = None,
+                    parsedData: Option[File] = None,
+                    featureData: Option[File] = None,
+                    model: Option[File] = None,
+                    outputDir: Option[File] = None)
+
+  val argsParser = new OptionParser[Params]("Translation Recommendations") {
+    head("Translation Recommendations", "")
+    note("This job ranks items missing in languages by how much they would be read")
+    help("help") text "Prints this usage text"
+
+    opt[File]('r', "raw-data")
+      .text("Raw data tsv of (id, site, title, pageviews) with header")
+      .optional()
+      .valueName("<file>")
+      .action((x, p) =>
+        p.copy(rawData = Some(x))
+      )
+      .validate(f => if (f.exists()) success else failure("File does not exist"))
+
+    opt[File]('p', "parsed-data")
+      .text("Parsed data of (id, site, title, pageviews)")
+      .optional()
+      .valueName("<path>")
+      .action((x, p) =>
+        p.copy(parsedData = Some(x))
+      )
+      .validate(f => if (f.exists()) success else failure("Path does not exist"))
+
+    opt[File]('f', "feature-data")
+      .text("Feature data of (id, (pageviews, rank, exists) * sites)")
+      .optional()
+      .valueName("<path>")
+      .action((x, p) =>
+        p.copy(featureData = Some(x))
+      )
+      .validate(f => if (f.exists()) success else failure("Path does not exist"))
+
+    opt[File]('m', "model")
+      .text("Model")
+      .optional()
+      .valueName("<path>")
+      .action((x, p) =>
+        p.copy(model = Some(x))
+      )
+      .validate(f => if (f.exists()) success else failure("Path does not exist"))
+
+    opt[File]('o', "output-dir")
+      .text("Directory to save the output of the steps")
+      .optional()
+      .valueName("<dir>")
+      .action((x, p) =>
+        p.copy(outputDir = Some(x))
+      )
+      .validate(f => if (f.exists() && f.isDirectory) success else failure("Dir is not valid"))
+
+    checkConfig(c =>
+      if (List(c.rawData, c.parsedData, c.featureData).map(o => if (o.isDefined) 1 else 0).sum != 1)
+        failure("Need to have one data source")
+      else
+        success
+    )
+  }
+
   def main(args: Array[String]): Unit = {
-    val spark: SparkSession = initializeSpark()
+    argsParser.parse(args, Params()) match {
+      case Some(params) => {
+        val spark = SparkSession
+          .builder()
+          .appName("TranslationRecommendations")
+          .master("local[*]")
+          .getOrCreate()
+        spark.sparkContext.setLogLevel("WARN")
 
-    val data: DataFrame = if (BUILD_DATA) getData(spark) else spark.read.load("./data")
-    val workData: DataFrame = getWorkData(spark, data, "enwiki")
+        val parsedData: Option[Dataset[SitelinkPageviewsEntry]] = params.rawData.map(parseRawData(spark, _))
 
-    val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
+        val featureData: Option[DataFrame] = parsedData.map(d => transformEntriesToFeatures(spark, d.rdd))
+          .orElse(params.featureData.map(d => spark.read.load(d.getAbsolutePath)))
 
-    val regressor = new RandomForestRegressor()
-      .setLabelCol(LABEL)
-      .setFeaturesCol(FEATURES)
+        val workData: DataFrame = getWorkData(spark, featureData.get, "enwiki")
+        val Array(trainingData, testData) = workData.randomSplit(Array(0.9, 0.1))
+        val regressor = new RandomForestRegressor()
+          .setLabelCol(LABEL)
+          .setFeaturesCol(FEATURES)
 
-    val model = if (BUILD_MODEL) regressor.fit(trainingData) else RandomForestRegressionModel.load("./model")
-    val predictions = model.transform(testData)
+        val model: Option[RandomForestRegressionModel] =
+          params.model.map(m => RandomForestRegressionModel.load(m.getAbsolutePath))
+          .orElse(Some(regressor.fit(trainingData)))
 
-    predictions.show(5)
+        val predictions = model.get.transform(testData)
 
-    val evaluator = new RegressionEvaluator()
-      .setLabelCol(LABEL)
-      .setPredictionCol(PREDICTION)
-      .setMetricName("rmse")
-    val rmse = evaluator.evaluate(predictions)
-    println("Root Mean Squared Error (RMSE) on test data = " + rmse)
+        predictions.show(5)
 
-    if (BUILD_DATA) {
-      data.write.mode(SaveMode.Overwrite).save("./data")
+        val evaluator = new RegressionEvaluator()
+          .setLabelCol(LABEL)
+          .setPredictionCol(PREDICTION)
+          .setMetricName("rmse")
+        val rmse = evaluator.evaluate(predictions)
+        println("Root Mean Squared Error (RMSE) on test data = " + rmse)
+
+        /* Save results if option is specified */
+        params.outputDir.foreach(o => parsedData.foreach(p =>
+          p.write.mode(SaveMode.ErrorIfExists).save(new File(o, "parsedData").getAbsolutePath)))
+        params.outputDir.foreach(o => featureData.foreach(f =>
+          f.write.mode(SaveMode.ErrorIfExists).save(new File(o, "featureData").getAbsolutePath)))
+        params.outputDir.foreach(o => model.foreach(m =>
+          m.write.save(new File(o, "model").getAbsolutePath)))
+
+        spark.stop()
+      }
+      case None => sys.exit(1)
     }
-    if (BUILD_MODEL) {
-      model.write.overwrite().save("./model")
-    }
-
-    spark.stop()
   }
 
-  def initializeSpark(): SparkSession = {
-    val spark = SparkSession
-      .builder()
-      .appName("TranslationRecommendations")
-      .master("local[*]")
-      .getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-    spark
-  }
-
-  def getData(spark: SparkSession): DataFrame = {
-    val sitelinkPageviewsEntries: Dataset[SitelinkPageviewsEntry] = getSitelinkPageviewsEntries(spark)
-    transformEntriesToFeatures(spark, sitelinkPageviewsEntries.rdd)
+  def parseRawData(spark: SparkSession, rawData: File): Dataset[SitelinkPageviewsEntry] = {
+    import spark.implicits._
+    spark.read
+      .format("csv")
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .option("mode", "DROPMALFORMED")
+      .option("sep", "\t")
+      .csv(rawData.getAbsolutePath)
+      .as[SitelinkPageviewsEntry]
   }
 
   def getWorkData(spark: SparkSession, data: DataFrame, target: String): DataFrame = {
@@ -87,18 +164,6 @@ object TranslationRecommendations {
     ).rdd
 
     spark.createDataFrame(labeledData).toDF("id", LABEL, FEATURES)
-  }
-
-  def getSitelinkPageviewsEntries(spark: SparkSession): Dataset[SitelinkPageviewsEntry] = {
-    import spark.implicits._
-    spark.read
-      .format("csv")
-      .option("header", "true")
-      .option("inferSchema", "true")
-      .option("mode", "DROPMALFORMED")
-      .option("sep", "\t")
-      .csv(INPUT_FILE)
-      .as[SitelinkPageviewsEntry]
   }
 
   case class PartitionKey(site: String, pageviews: Double) extends Ordered[PartitionKey] {
