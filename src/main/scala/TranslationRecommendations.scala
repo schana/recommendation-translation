@@ -1,14 +1,17 @@
 import java.io.File
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 
-import scala.math.Ordered.orderingToOrdered
 import org.apache.spark.Partitioner
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.linalg.DenseVector
-import org.apache.spark.ml.regression.{RandomForestRegressionModel, RandomForestRegressor}
+import org.apache.spark.ml.regression.RandomForestRegressor
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 import org.apache.spark.sql._
+import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 import scopt.OptionParser
+
+import scala.math.Ordered.orderingToOrdered
 
 case class SitelinkPageviewsEntry(id: String, site: String, title: String, pageviews: Double)
 
@@ -24,8 +27,12 @@ object TranslationRecommendations {
   case class Params(rawData: Option[File] = None,
                     parsedData: Option[File] = None,
                     featureData: Option[File] = None,
-                    model: Option[File] = None,
-                    outputDir: Option[File] = None)
+                    outputDir: Option[File] = None,
+                    /* Actions */
+                    parseRawData: Boolean = false,
+                    extractFeatures: Boolean = false,
+                    buildModels: Boolean = false,
+                    scoreItems: Boolean = false)
 
   val argsParser = new OptionParser[Params]("Translation Recommendations") {
     head("Translation Recommendations", "")
@@ -59,15 +66,6 @@ object TranslationRecommendations {
       )
       .validate(f => if (f.exists()) success else failure("Path does not exist"))
 
-    opt[File]('m', "model")
-      .text("Model")
-      .optional()
-      .valueName("<path>")
-      .action((x, p) =>
-        p.copy(model = Some(x))
-      )
-      .validate(f => if (f.exists()) success else failure("Path does not exist"))
-
     opt[File]('o', "output-dir")
       .text("Directory to save the output of the steps")
       .optional()
@@ -77,11 +75,36 @@ object TranslationRecommendations {
       )
       .validate(f => if (f.exists() && f.isDirectory) success else failure("Dir is not valid"))
 
+    opt[Unit]('r', "parse-raw-data")
+      .text("Action to parse raw data")
+      .optional()
+      .action((_, p) => p.copy(parseRawData = true))
+
+    opt[Unit]('x', "extract-features")
+      .text("Action to extract features from parsed data")
+      .optional()
+      .action((_, p) => p.copy(extractFeatures = true))
+
+    opt[Unit]('b', "build-models")
+      .text("Action to build models")
+      .optional()
+      .action((_, p) => p.copy(buildModels = true))
+
+    opt[Unit]('s', "score-items")
+      .text("Action to score items")
+      .optional()
+      .action((_, p) => p.copy(scoreItems = true))
+
     checkConfig(c =>
-      if (List(c.rawData, c.parsedData, c.featureData).map(o => if (o.isDefined) 1 else 0).sum != 1)
-        failure("Need to have one data source")
-      else
+      if (c.parseRawData && c.rawData.isEmpty) {
+        failure("Raw data not specified")
+      } else if (!c.parseRawData && c.parsedData.isEmpty) {
+        failure("Parsed data not specified")
+      } else if (!c.extractFeatures && c.featureData.isEmpty) {
+        failure("Feature data not specified")
+      } else {
         success
+      }
     )
   }
 
@@ -95,39 +118,59 @@ object TranslationRecommendations {
           .getOrCreate()
         spark.sparkContext.setLogLevel("WARN")
 
-        val parsedData: Option[Dataset[SitelinkPageviewsEntry]] = params.rawData.map(parseRawData(spark, _))
+        val timestamp = ZonedDateTime.now().format(DateTimeFormatter.ISO_INSTANT)
 
-        val featureData: Option[DataFrame] = parsedData.map(d => transformEntriesToFeatures(spark, d.rdd))
-          .orElse(params.featureData.map(d => spark.read.load(d.getAbsolutePath)))
+        val parsedData: Dataset[SitelinkPageviewsEntry] =
+          if (params.parseRawData) {
+            val p = parseRawData(spark, params.rawData.get)
+            params.outputDir.foreach(o =>
+              p.write.mode(SaveMode.ErrorIfExists).save(new File(o, timestamp + "_parsedData").getAbsolutePath))
+            p
+          } else {
+            import spark.implicits._
+            spark.read.load(params.parsedData.get.getAbsolutePath).as[SitelinkPageviewsEntry]
+          }
 
-        val workData: DataFrame = getWorkData(spark, featureData.get, "enwiki")
-        val Array(trainingData, testData) = workData.randomSplit(Array(0.9, 0.1))
+        val featureData: DataFrame =
+          if (params.extractFeatures) {
+            val f = transformEntriesToFeatures(spark, parsedData.rdd)
+            params.outputDir.foreach(o =>
+              f.write.mode(SaveMode.ErrorIfExists).save(new File(o, timestamp + "_featureData").getAbsolutePath))
+            f
+          } else {
+            spark.read.load(params.featureData.get.getAbsolutePath)
+          }
+
         val regressor = new RandomForestRegressor()
           .setLabelCol(LABEL)
           .setFeaturesCol(FEATURES)
-
-        val model: Option[RandomForestRegressionModel] =
-          params.model.map(m => RandomForestRegressionModel.load(m.getAbsolutePath))
-          .orElse(Some(regressor.fit(trainingData)))
-
-        val predictions = model.get.transform(testData)
-
-        predictions.show(5)
-
         val evaluator = new RegressionEvaluator()
           .setLabelCol(LABEL)
           .setPredictionCol(PREDICTION)
           .setMetricName("rmse")
-        val rmse = evaluator.evaluate(predictions)
-        println("Root Mean Squared Error (RMSE) on test data = " + rmse)
 
-        /* Save results if option is specified */
-        params.outputDir.foreach(o => parsedData.foreach(p =>
-          p.write.mode(SaveMode.ErrorIfExists).save(new File(o, "parsedData").getAbsolutePath)))
-        params.outputDir.foreach(o => featureData.foreach(f =>
-          f.write.mode(SaveMode.ErrorIfExists).save(new File(o, "featureData").getAbsolutePath)))
-        params.outputDir.foreach(o => model.foreach(m =>
-          m.write.save(new File(o, "model").getAbsolutePath)))
+        if (params.buildModels) {
+          val sites = parsedData.rdd.map(_.site).distinct().collect().sorted
+          sites.foreach(target => {
+            try {
+              println(target)
+              val workData: DataFrame = getWorkData(spark, featureData, target)
+              val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
+              val model = regressor.fit(trainingData)
+
+              params.outputDir.foreach(o =>
+                model.write.save(new File(o, timestamp + "_model_" + target).getAbsolutePath))
+
+              val predictions = model.transform(testData)
+
+              predictions.show(5)
+              val rmse = evaluator.evaluate(predictions)
+              println("Root Mean Squared Error (RMSE) on test data = " + rmse)
+            } catch {
+              case unknown: Throwable => println("Build model for " + target + " failed: " + unknown)
+            }
+          })
+        }
 
         spark.stop()
       }
@@ -204,8 +247,7 @@ object TranslationRecommendations {
           }
           rank = rank + 1
           RankedEntry(id, key.site, title, key.pageviews, rank.toDouble / currentSiteEntryCount.get)
-        }
-        }
+        }}
       })
 
     /*
