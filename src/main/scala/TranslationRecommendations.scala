@@ -13,6 +13,10 @@ import scopt.OptionParser
 
 import scala.math.Ordered.orderingToOrdered
 
+case class SitelinkEntry(id: String, site: String, title: String)
+
+case class PagecountEntry(site: String, title: String, pageviews: Double)
+
 case class SitelinkPageviewsEntry(id: String, site: String, title: String, pageviews: Double)
 
 case class RankedEntry(id: String, site: String, title: String, pageviews: Double, rank: Double)
@@ -24,7 +28,9 @@ object TranslationRecommendations {
   val EXISTS = 1.0
   val NOT_EXISTS = 0.0
 
-  case class Params(rawData: Option[File] = None,
+  case class Params(rawSitelinks: Option[File] = None,
+                    rawPagecounts: Option[File] = None,
+                    rawData: Option[File] = None,
                     parsedData: Option[File] = None,
                     featureData: Option[File] = None,
                     modelsDir: Option[File] = None,
@@ -40,6 +46,42 @@ object TranslationRecommendations {
     head("Translation Recommendations", "")
     note("This job ranks items missing in languages by how much they would be read")
     help("help") text "Prints this usage text"
+
+    /*
+      mysql --host analytics-store.eqiad.wmnet wikidatawiki -e "select concat('Q', ips_item_id) as id, ips_site_id as site, replace(ips_site_page, ' ', '_') as title from wb_items_per_site join page on page_title = concat('Q', ips_item_id) where page_namespace = 0 and ips_site_id like '%wiki';" > sitelinks.tsv
+      select
+        concat('Q', ips_item_id) as id,
+        ips_site_id as site,
+        replace(ips_site_page, ' ', '_') as title
+      from
+        wb_items_per_site
+      join
+        page on page_title = concat('Q', ips_item_id)
+      where
+        page_namespace = 0
+        and
+        ips_site_id like '%wiki';
+     */
+    opt[File]("raw-sitelinks")
+      .text("Raw sitelink data extracted from mysql")
+      .optional()
+      .valueName("<file>")
+      .action((x, p) =>
+        p.copy(rawSitelinks = Some(x))
+      )
+      .validate(f => if (f.exists()) success else failure("File does not exist"))
+
+    /*
+     * https://dumps.wikimedia.org/other/pagecounts-ez/merged/pagecounts-<year>-<month>-views-ge-5-totals.bz2
+     */
+    opt[File]("raw-pagecounts")
+      .text("Raw pagecount data from wikimedia dumps")
+      .optional()
+      .valueName("<file>")
+      .action((x, p) =>
+        p.copy(rawPagecounts = Some(x))
+      )
+      .validate(f => if (f.exists()) success else failure("File does not exist"))
 
     opt[File]('r', "raw-data")
       .text("Raw data tsv of (id, site, title, pageviews) with header")
@@ -111,11 +153,11 @@ object TranslationRecommendations {
       .action((x, p) => p.copy(targetWikis = x))
 
     checkConfig(c =>
-      if (c.parseRawData && c.rawData.isEmpty) {
+      if (c.parseRawData && (c.rawData.isEmpty && (c.rawSitelinks.isEmpty || c.rawPagecounts.isEmpty))) {
         failure("Raw data not specified")
       } else if (!c.parseRawData && c.parsedData.isEmpty) {
         failure("Parsed data not specified")
-      } else if (!c.extractFeatures && c.featureData.isEmpty) {
+      } else if (c.buildModels && !c.extractFeatures && c.featureData.isEmpty) {
         failure("Feature data not specified")
       } else {
         success
@@ -129,7 +171,7 @@ object TranslationRecommendations {
         val spark = SparkSession
           .builder()
           .appName("TranslationRecommendations")
-          .master("local[*]")
+          .master("local[1]")
           .getOrCreate()
         spark.sparkContext.setLogLevel("WARN")
 
@@ -137,7 +179,7 @@ object TranslationRecommendations {
 
         val parsedData: Dataset[SitelinkPageviewsEntry] =
           if (params.parseRawData) {
-            val p = parseRawData(spark, params.rawData.get)
+            val p = parseRawData(spark, params.rawSitelinks, params.rawPagecounts, params.rawData)
             params.outputDir.foreach(o =>
               p.write.mode(SaveMode.ErrorIfExists).save(new File(o, timestamp + "_parsedData").getAbsolutePath))
             p
@@ -219,16 +261,58 @@ object TranslationRecommendations {
     }
   }
 
-  def parseRawData(spark: SparkSession, rawData: File): Dataset[SitelinkPageviewsEntry] = {
+  def parseRawData(
+    spark: SparkSession,
+    rawSitelinks: Option[File],
+    rawPagecounts: Option[File],
+    rawData: Option[File]
+  ): Dataset[SitelinkPageviewsEntry] = {
     import spark.implicits._
-    spark.read
-      .format("csv")
-      .option("header", "true")
-      .option("inferSchema", "true")
-      .option("mode", "DROPMALFORMED")
-      .option("sep", "\t")
-      .csv(rawData.getAbsolutePath)
-      .as[SitelinkPageviewsEntry]
+
+    if (rawData.isEmpty) {
+      val sitelinks = spark.read
+        .format("csv")
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("mode", "DROPMALFORMED")
+        .option("sep", "\t")
+        .csv(rawSitelinks.get.getAbsolutePath)
+        .as[SitelinkEntry]
+
+      val pagecountSchema = StructType(Array(
+        StructField("site", StringType),
+        StructField("title", StringType),
+        StructField("pageviews", DoubleType)
+      ))
+
+      val pagecounts = spark.read
+        .format("csv")
+        .option("quote", "\0")
+        .option("escape", "\0")
+        .option("mode", "DROPMALFORMED")
+        .option("sep", " ")
+        .schema(pagecountSchema)
+        .csv(rawPagecounts.get.getAbsolutePath)
+        .as[PagecountEntry]
+
+        .filter(_.site.endsWith(".z"))
+        .map(e => PagecountEntry(
+          site = """\.z$""".r.replaceFirstIn(e.site, "wiki"),
+          title = e.title,
+          pageviews = e.pageviews))
+
+      sitelinks.join(pagecounts, usingColumns = Seq("site", "title"))
+        .as[SitelinkPageviewsEntry]
+    } else {
+      spark.read
+        .format("csv")
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("mode", "DROPMALFORMED")
+        .option("sep", "\t")
+        .csv(rawData.get.getAbsolutePath)
+        .as[SitelinkPageviewsEntry]
+    }
   }
 
   def getWorkData(spark: SparkSession, data: DataFrame, target: String, exists: Boolean = true): DataFrame = {
