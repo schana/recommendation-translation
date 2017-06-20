@@ -2,8 +2,6 @@ import java.io.File
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.FileSystem
 import org.apache.log4j.{Level, LogManager, Logger}
 import org.apache.spark.Partitioner
 import org.apache.spark.ml.evaluation.RegressionEvaluator
@@ -32,8 +30,9 @@ object TranslationRecommendations {
   val EXISTS = 1.0
   val NOT_EXISTS = 0.0
 
-  case class Params(rawSitelinks: Option[File] = None,
-                    rawPagecounts: Option[String] = None,
+  case class Params(runLocally: Boolean = false,
+                    rawSitelinks: Option[File] = None,
+                    rawPagecounts: Option[File] = None,
                     rawData: Option[File] = None,
                     parsedData: Option[File] = None,
                     featureData: Option[File] = None,
@@ -50,6 +49,11 @@ object TranslationRecommendations {
     head("Translation Recommendations", "")
     note("This job ranks items missing in languages by how much they would be read")
     help("help") text "Prints this usage text"
+
+    opt[Unit]('l', "local")
+      .text("Run Spark locally")
+      .optional()
+      .action((_, p) => p.copy(runLocally = true))
 
     /*
       mysql --host analytics-store.eqiad.wmnet wikidatawiki -e "select concat('Q', ips_item_id) as id, ips_site_id as site, replace(ips_site_page, ' ', '_') as title from wb_items_per_site join page on page_title = concat('Q', ips_item_id) where page_namespace = 0 and ips_site_id like '%wiki';" > sitelinks.tsv
@@ -78,14 +82,14 @@ object TranslationRecommendations {
     /*
      * https://dumps.wikimedia.org/other/pagecounts-ez/merged/pagecounts-<year>-<month>-views-ge-5-totals.bz2
      */
-    opt[String]("raw-pagecounts")
+    opt[File]("raw-pagecounts")
       .text("Raw pagecount data from wikimedia dumps")
       .optional()
       .valueName("<file>")
       .action((x, p) =>
         p.copy(rawPagecounts = Some(x))
       )
-      .validate(f => if (new File(f).exists()) success else failure("File does not exist"))
+      .validate(f => if (f.exists()) success else failure("File does not exist"))
 
     opt[File]('r', "raw-data")
       .text("Raw data tsv of (id, site, title, pageviews) with header")
@@ -175,11 +179,13 @@ object TranslationRecommendations {
     log.info("Starting")
     argsParser.parse(args, Params()) match {
       case Some(params) => {
-        val spark = SparkSession
+        var sparkBuilder = SparkSession
           .builder()
           .appName("TranslationRecommendations")
-          .master("local[1]")
-          .getOrCreate()
+        if (params.runLocally) {
+          sparkBuilder = sparkBuilder.master("local[*]")
+        }
+        val spark = sparkBuilder.getOrCreate()
         Logger.getLogger("org").setLevel(Level.WARN)
 
         val timestamp = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss"))
@@ -194,7 +200,7 @@ object TranslationRecommendations {
               p.write.mode(SaveMode.ErrorIfExists).save(new File(o, timestamp + "_parsedData").getAbsolutePath))
             p
           } else {
-            log.info("Reading raw data")
+            log.info("Reading parsed data")
             import spark.implicits._
             spark.read.load(params.parsedData.get.getAbsolutePath).as[SitelinkPageviewsEntry]
           }
@@ -285,12 +291,13 @@ object TranslationRecommendations {
   def parseRawData(
     spark: SparkSession,
     rawSitelinks: Option[File],
-    rawPagecounts: Option[String],
+    rawPagecounts: Option[File],
     rawData: Option[File]
   ): Dataset[SitelinkPageviewsEntry] = {
     import spark.implicits._
 
     if (rawData.isEmpty) {
+      log.info("Reading raw sitelinks")
       val sitelinks = spark.read
         .format("csv")
         .option("header", "true")
@@ -300,11 +307,12 @@ object TranslationRecommendations {
         .csv(rawSitelinks.get.getAbsolutePath)
         .as[SitelinkEntry]
 
-      val pagecounts = getPagecounts(spark, rawPagecounts.get)
+      val pagecounts = getPagecounts(spark, rawPagecounts)
 
       sitelinks.join(pagecounts, usingColumns = Seq("site", "title"))
         .as[SitelinkPageviewsEntry]
     } else {
+      log.info("Reading raw data")
       spark.read
         .format("csv")
         .option("header", "true")
@@ -316,19 +324,16 @@ object TranslationRecommendations {
     }
   }
 
-  def getPagecounts(spark: SparkSession, rawPagecounts: String): Dataset[PagecountEntry] = {
-    /* Check whether rawPagecounts is on HDFS */
-    val conf = new Configuration()
-    val fs = FileSystem.get(conf)
-    val onHadoop = fs.exists(new org.apache.hadoop.fs.Path(rawPagecounts))
-
+  def getPagecounts(spark: SparkSession, rawPagecounts: Option[File]): Dataset[PagecountEntry] = {
     import spark.implicits._
-    if (onHadoop) {
+    if (rawPagecounts.isEmpty) {
       /* TODO: Load the data from hdfs */
-      println("raw pagecounts on hadoop")
+      log.info("Reading pagecounts from hadoop")
 
       spark.emptyDataset[PagecountEntry]
     } else {
+      log.info("Reading raw pagecounts")
+
       val pagecountSchema = StructType(Array(
         StructField("site", StringType),
         StructField("title", StringType),
@@ -342,7 +347,7 @@ object TranslationRecommendations {
         .option("mode", "DROPMALFORMED")
         .option("sep", " ")
         .schema(pagecountSchema)
-        .csv(rawPagecounts)
+        .csv(rawPagecounts.get.getAbsolutePath)
         .as[PagecountEntry]
 
         .filter(_.site.endsWith(".z"))
