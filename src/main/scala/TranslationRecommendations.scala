@@ -12,6 +12,8 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 import scopt.OptionParser
 
+import scala.collection.parallel.ForkJoinTaskSupport
+import scala.concurrent.forkjoin.ForkJoinPool
 import scala.math.Ordered.orderingToOrdered
 
 case class SitelinkEntry(id: String, site: String, title: String)
@@ -223,29 +225,36 @@ object TranslationRecommendations {
         else
           parsedData.rdd.map(_.site).distinct().collect().sorted
 
+        /* work on sites in parallel */
+        val forkCount = 8
+        val modelSites = sites.par
+        modelSites.tasksupport = new ForkJoinTaskSupport(
+          new ForkJoinPool(forkCount)
+        )
+
         if (params.buildModels) {
           log.info("Building Models")
           val modelsOutputDir = params.outputDir.map(o => new File(o, timestamp + "_models"))
           modelsOutputDir.foreach(o => o.mkdir())
-          sites.foreach(target => {
+          modelSites.foreach(target =>
             try {
               log.info("Building model for " + target)
-              log.info("Getting work data")
+              log.info("Getting work data for " + target)
               val workData: DataFrame = getWorkData(spark, featureData, target)
               val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
-              log.info("Training model")
+              log.info("Training model for " + target)
               val model = regressor.fit(trainingData)
-              log.info("Writing model to file")
+              log.info("Writing model to file for " + target)
               modelsOutputDir.foreach(o => model.write.save(new File(o, target).getAbsolutePath))
-              log.info("Testing model")
+              log.info("Testing model for " + target)
               val predictions = model.transform(testData)
               predictions.show(5)
               val rmse = evaluator.evaluate(predictions)
-              log.info("Root Mean Squared Error (RMSE) on test data = " + rmse)
+              log.info("Root Mean Squared Error (RMSE) on test data for " + target + " = " + rmse)
             } catch {
               case unknown: Throwable => log.error("Build model for " + target + " failed", unknown)
             }
-          })
+          )
         }
 
         if (params.scoreItems) {
@@ -253,19 +262,19 @@ object TranslationRecommendations {
           val modelsOutputDir = params.modelsDir.getOrElse(new File(params.outputDir.get, timestamp + "_models"))
           val predictionsOutputDir = params.outputDir.map(o => new File(o, timestamp + "_predictions"))
           predictionsOutputDir.foreach(o => o.mkdir())
-          sites.foreach(target => {
+          modelSites.foreach(target => {
             try {
               log.info("Scoring for " + target)
-              log.info("Getting work data")
+              log.info("Getting work data for " + target)
               val workData: DataFrame = getWorkData(spark, featureData, target, exists = false)
-              log.info("Loading model")
+              log.info("Loading model for " + target)
               val model = RandomForestRegressionModel.load(
                 new File(modelsOutputDir, target).getAbsolutePath)
-              log.info("Scoring data")
+              log.info("Scoring data for " + target)
               val predictions = model.transform(workData).select("id", PREDICTION)
 
               predictions.show(5)
-              log.info("Saving scores")
+              log.info("Saving scores for " + target)
               predictionsOutputDir.foreach(o =>
                 predictions.write.mode(SaveMode.ErrorIfExists).csv(new File(o, target).getAbsolutePath))
             } catch {
@@ -320,10 +329,15 @@ object TranslationRecommendations {
   def getPagecounts(spark: SparkSession, rawPagecounts: Option[File]): Dataset[PagecountEntry] = {
     import spark.implicits._
     if (rawPagecounts.isEmpty) {
-      /* TODO: Load the data from hdfs */
       log.info("Reading pagecounts from hadoop")
 
-      spark.emptyDataset[PagecountEntry]
+      spark.sql(
+        """
+          |SELECT project as site, page_title as title, sum(view_count) as pageviews
+          |FROM wmf.pageview_hourly
+          |WHERE year=2017 and month=1 and day=1
+          |GROUP BY project, page_title
+        """.stripMargin).as[PagecountEntry]
     } else {
       log.info("Reading raw pagecounts")
 
