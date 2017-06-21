@@ -1,6 +1,6 @@
 import java.io.File
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
+import java.util.Calendar
 
 import org.apache.log4j.{Level, LogManager, Logger}
 import org.apache.spark.Partitioner
@@ -77,7 +77,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(rawSitelinks = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("File does not exist"))
 
     /*
      * https://dumps.wikimedia.org/other/pagecounts-ez/merged/pagecounts-<year>-<month>-views-ge-5-totals.bz2
@@ -89,7 +88,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(rawPagecounts = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("File does not exist"))
 
     opt[File]('r', "raw-data")
       .text("Raw data tsv of (id, site, title, pageviews) with header")
@@ -98,7 +96,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(rawData = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("File does not exist"))
 
     opt[File]('p', "parsed-data")
       .text("Parsed data of (id, site, title, pageviews)")
@@ -107,7 +104,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(parsedData = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("Path does not exist"))
 
     opt[File]('f', "feature-data")
       .text("Feature data of (id, (pageviews, rank, exists) * sites)")
@@ -116,14 +112,12 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(featureData = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("Path does not exist"))
 
     opt[File]('m', "models-dir")
       .text("Directory containing models named by target wiki")
       .optional()
       .valueName("<dir>")
       .action((x, p) => p.copy(modelsDir = Some(x)))
-      .validate(f => if (f.exists() && f.isDirectory) success else failure("Dir is not valid"))
 
     opt[File]('o', "output-dir")
       .text("Directory to save the output of the steps")
@@ -132,7 +126,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(outputDir = Some(x))
       )
-      .validate(f => if (f.exists() && f.isDirectory) success else failure("Dir is not valid"))
 
     opt[Unit]('a', "parse-raw-data")
       .text("Action to parse raw data")
@@ -188,7 +181,7 @@ object TranslationRecommendations {
         val spark = sparkBuilder.getOrCreate()
         Logger.getLogger("org").setLevel(Level.WARN)
 
-        val timestamp = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss"))
+        val timestamp = new SimpleDateFormat("yyyy-MM-dd-HHmmss").format(Calendar.getInstance.getTime)
 
         log.info("Timestamp for creating files: " + timestamp)
 
