@@ -1,7 +1,8 @@
 import java.io.File
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
+import java.util.Calendar
 
+import org.apache.log4j.{Level, LogManager, Logger}
 import org.apache.spark.Partitioner
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.linalg.DenseVector
@@ -11,20 +12,30 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 import scopt.OptionParser
 
+import scala.collection.parallel.ForkJoinTaskSupport
+import scala.concurrent.forkjoin.ForkJoinPool
 import scala.math.Ordered.orderingToOrdered
+
+case class SitelinkEntry(id: String, site: String, title: String)
+
+case class PagecountEntry(site: String, title: String, pageviews: Double)
 
 case class SitelinkPageviewsEntry(id: String, site: String, title: String, pageviews: Double)
 
 case class RankedEntry(id: String, site: String, title: String, pageviews: Double, rank: Double)
 
 object TranslationRecommendations {
+  val log: Logger = LogManager.getLogger(TranslationRecommendations.getClass)
   val FEATURES = "features"
   val LABEL = "label"
   val PREDICTION = "prediction"
   val EXISTS = 1.0
   val NOT_EXISTS = 0.0
 
-  case class Params(rawData: Option[File] = None,
+  case class Params(runLocally: Boolean = false,
+                    rawSitelinks: Option[File] = None,
+                    rawPagecounts: Option[File] = None,
+                    rawData: Option[File] = None,
                     parsedData: Option[File] = None,
                     featureData: Option[File] = None,
                     modelsDir: Option[File] = None,
@@ -41,6 +52,45 @@ object TranslationRecommendations {
     note("This job ranks items missing in languages by how much they would be read")
     help("help") text "Prints this usage text"
 
+    opt[Unit]('l', "local")
+      .text("Run Spark locally")
+      .optional()
+      .action((_, p) => p.copy(runLocally = true))
+
+    /*
+      mysql --host analytics-store.eqiad.wmnet wikidatawiki -e "select concat('Q', ips_item_id) as id, ips_site_id as site, replace(ips_site_page, ' ', '_') as title from wb_items_per_site join page on page_title = concat('Q', ips_item_id) where page_namespace = 0 and ips_site_id like '%wiki';" > sitelinks.tsv
+      select
+        concat('Q', ips_item_id) as id,
+        ips_site_id as site,
+        replace(ips_site_page, ' ', '_') as title
+      from
+        wb_items_per_site
+      join
+        page on page_title = concat('Q', ips_item_id)
+      where
+        page_namespace = 0
+        and
+        ips_site_id like '%wiki';
+     */
+    opt[File]("raw-sitelinks")
+      .text("Raw sitelink data extracted from mysql")
+      .optional()
+      .valueName("<file>")
+      .action((x, p) =>
+        p.copy(rawSitelinks = Some(x))
+      )
+
+    /*
+     * https://dumps.wikimedia.org/other/pagecounts-ez/merged/pagecounts-<year>-<month>-views-ge-5-totals.bz2
+     */
+    opt[File]("raw-pagecounts")
+      .text("Raw pagecount data from wikimedia dumps")
+      .optional()
+      .valueName("<file>")
+      .action((x, p) =>
+        p.copy(rawPagecounts = Some(x))
+      )
+
     opt[File]('r', "raw-data")
       .text("Raw data tsv of (id, site, title, pageviews) with header")
       .optional()
@@ -48,7 +98,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(rawData = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("File does not exist"))
 
     opt[File]('p', "parsed-data")
       .text("Parsed data of (id, site, title, pageviews)")
@@ -57,7 +106,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(parsedData = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("Path does not exist"))
 
     opt[File]('f', "feature-data")
       .text("Feature data of (id, (pageviews, rank, exists) * sites)")
@@ -66,14 +114,12 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(featureData = Some(x))
       )
-      .validate(f => if (f.exists()) success else failure("Path does not exist"))
 
     opt[File]('m', "models-dir")
       .text("Directory containing models named by target wiki")
       .optional()
       .valueName("<dir>")
       .action((x, p) => p.copy(modelsDir = Some(x)))
-      .validate(f => if (f.exists() && f.isDirectory) success else failure("Dir is not valid"))
 
     opt[File]('o', "output-dir")
       .text("Directory to save the output of the steps")
@@ -82,7 +128,6 @@ object TranslationRecommendations {
       .action((x, p) =>
         p.copy(outputDir = Some(x))
       )
-      .validate(f => if (f.exists() && f.isDirectory) success else failure("Dir is not valid"))
 
     opt[Unit]('a', "parse-raw-data")
       .text("Action to parse raw data")
@@ -111,12 +156,14 @@ object TranslationRecommendations {
       .action((x, p) => p.copy(targetWikis = x))
 
     checkConfig(c =>
-      if (c.parseRawData && c.rawData.isEmpty) {
+      if (c.parseRawData && (c.rawData.isEmpty && (c.rawSitelinks.isEmpty || c.rawPagecounts.isEmpty))) {
         failure("Raw data not specified")
       } else if (!c.parseRawData && c.parsedData.isEmpty) {
         failure("Parsed data not specified")
-      } else if (!c.extractFeatures && c.featureData.isEmpty) {
+      } else if (c.buildModels && !c.extractFeatures && c.featureData.isEmpty) {
         failure("Feature data not specified")
+      } else if (c.scoreItems && c.modelsDir.isEmpty && (!c.buildModels || c.outputDir.isEmpty)) {
+        failure("No models available for scoring. Either (build models and specify --output-dir) or (specify --models-dir)")
       } else {
         success
       }
@@ -124,35 +171,44 @@ object TranslationRecommendations {
   }
 
   def main(args: Array[String]): Unit = {
+    log.info("Starting")
     argsParser.parse(args, Params()) match {
       case Some(params) => {
-        val spark = SparkSession
+        var sparkBuilder = SparkSession
           .builder()
           .appName("TranslationRecommendations")
-          .master("local[*]")
-          .getOrCreate()
-        spark.sparkContext.setLogLevel("WARN")
+        if (params.runLocally) {
+          sparkBuilder = sparkBuilder.master("local[*]")
+        }
+        val spark = sparkBuilder.getOrCreate()
+        Logger.getLogger("org").setLevel(Level.WARN)
 
-        val timestamp = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss"))
+        val timestamp = new SimpleDateFormat("yyyy-MM-dd-HHmmss").format(Calendar.getInstance.getTime)
+
+        log.info("Timestamp for creating files: " + timestamp)
 
         val parsedData: Dataset[SitelinkPageviewsEntry] =
           if (params.parseRawData) {
-            val p = parseRawData(spark, params.rawData.get)
+            log.info("Parsing raw data")
+            val p = parseRawData(spark, params.rawSitelinks, params.rawPagecounts, params.rawData)
             params.outputDir.foreach(o =>
               p.write.mode(SaveMode.ErrorIfExists).save(new File(o, timestamp + "_parsedData").getAbsolutePath))
             p
           } else {
+            log.info("Reading parsed data")
             import spark.implicits._
             spark.read.load(params.parsedData.get.getAbsolutePath).as[SitelinkPageviewsEntry]
           }
 
         val featureData: DataFrame =
           if (params.extractFeatures) {
+            log.info("Extracting feature data")
             val f = transformEntriesToFeatures(spark, parsedData.rdd)
             params.outputDir.foreach(o =>
               f.write.mode(SaveMode.ErrorIfExists).save(new File(o, timestamp + "_featureData").getAbsolutePath))
             f
           } else {
+            log.info("Reading feature data")
             spark.read.load(params.featureData.get.getAbsolutePath)
           }
 
@@ -169,66 +225,146 @@ object TranslationRecommendations {
         else
           parsedData.rdd.map(_.site).distinct().collect().sorted
 
+        /* work on sites in parallel */
+        val forkCount = 8
+        val modelSites = sites.par
+        modelSites.tasksupport = new ForkJoinTaskSupport(
+          new ForkJoinPool(forkCount)
+        )
+
         if (params.buildModels) {
+          log.info("Building Models")
           val modelsOutputDir = params.outputDir.map(o => new File(o, timestamp + "_models"))
           modelsOutputDir.foreach(o => o.mkdir())
-          sites.foreach(target => {
+          modelSites.foreach(target =>
             try {
-              println(target)
+              log.info("Building model for " + target)
+              log.info("Getting work data for " + target)
               val workData: DataFrame = getWorkData(spark, featureData, target)
               val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
+              log.info("Training model for " + target)
               val model = regressor.fit(trainingData)
-
+              log.info("Writing model to file for " + target)
               modelsOutputDir.foreach(o => model.write.save(new File(o, target).getAbsolutePath))
-
+              log.info("Testing model for " + target)
               val predictions = model.transform(testData)
               predictions.show(5)
               val rmse = evaluator.evaluate(predictions)
-              println("Root Mean Squared Error (RMSE) on test data = " + rmse)
+              log.info("Root Mean Squared Error (RMSE) on test data for " + target + " = " + rmse)
             } catch {
-              case unknown: Throwable => println("Build model for " + target + " failed: " + unknown)
+              case unknown: Throwable => log.error("Build model for " + target + " failed", unknown)
             }
-          })
+          )
         }
 
         if (params.scoreItems) {
+          log.info("Scoring items")
+          val modelsOutputDir = params.modelsDir.getOrElse(new File(params.outputDir.get, timestamp + "_models"))
           val predictionsOutputDir = params.outputDir.map(o => new File(o, timestamp + "_predictions"))
           predictionsOutputDir.foreach(o => o.mkdir())
-          sites.foreach(target => {
+          modelSites.foreach(target => {
             try {
-              println(target)
+              log.info("Scoring for " + target)
+              log.info("Getting work data for " + target)
               val workData: DataFrame = getWorkData(spark, featureData, target, exists = false)
+              log.info("Loading model for " + target)
               val model = RandomForestRegressionModel.load(
-                new File(params.modelsDir.get, target).getAbsolutePath)
-
+                new File(modelsOutputDir, target).getAbsolutePath)
+              log.info("Scoring data for " + target)
               val predictions = model.transform(workData).select("id", PREDICTION)
 
               predictions.show(5)
-
+              log.info("Saving scores for " + target)
               predictionsOutputDir.foreach(o =>
                 predictions.write.mode(SaveMode.ErrorIfExists).csv(new File(o, target).getAbsolutePath))
             } catch {
-              case unknown: Throwable => println("Score for " + target + " failed: " + unknown)
+              case unknown: Throwable => log.error("Score for " + target + " failed", unknown)
             }
           })
         }
 
+        log.info("Finished")
         spark.stop()
       }
       case None => sys.exit(1)
     }
   }
 
-  def parseRawData(spark: SparkSession, rawData: File): Dataset[SitelinkPageviewsEntry] = {
+  def parseRawData(
+    spark: SparkSession,
+    rawSitelinks: Option[File],
+    rawPagecounts: Option[File],
+    rawData: Option[File]
+  ): Dataset[SitelinkPageviewsEntry] = {
     import spark.implicits._
-    spark.read
-      .format("csv")
-      .option("header", "true")
-      .option("inferSchema", "true")
-      .option("mode", "DROPMALFORMED")
-      .option("sep", "\t")
-      .csv(rawData.getAbsolutePath)
-      .as[SitelinkPageviewsEntry]
+
+    if (rawData.isEmpty) {
+      log.info("Reading raw sitelinks")
+      val sitelinks = spark.read
+        .format("csv")
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("mode", "DROPMALFORMED")
+        .option("sep", "\t")
+        .csv(rawSitelinks.get.getAbsolutePath)
+        .as[SitelinkEntry]
+
+      val pagecounts = getPagecounts(spark, rawPagecounts)
+
+      sitelinks.join(pagecounts, usingColumns = Seq("site", "title"))
+        .as[SitelinkPageviewsEntry]
+    } else {
+      log.info("Reading raw data")
+      spark.read
+        .format("csv")
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("mode", "DROPMALFORMED")
+        .option("sep", "\t")
+        .csv(rawData.get.getAbsolutePath)
+        .as[SitelinkPageviewsEntry]
+    }
+  }
+
+  def getPagecounts(spark: SparkSession, rawPagecounts: Option[File]): Dataset[PagecountEntry] = {
+    import spark.implicits._
+    if (rawPagecounts.isEmpty) {
+      log.info("Reading pagecounts from hadoop")
+
+      spark.sql(
+        """
+          |SELECT project as site, page_title as title, sum(view_count) as pageviews
+          |FROM wmf.pageview_hourly
+          |WHERE year=2017 and month=1 and day=1
+          |GROUP BY project, page_title
+        """.stripMargin).as[PagecountEntry]
+    } else {
+      log.info("Reading raw pagecounts")
+
+      val pagecountSchema = StructType(Array(
+        StructField("site", StringType),
+        StructField("title", StringType),
+        StructField("pageviews", DoubleType)
+      ))
+
+      val pagecounts = spark.read
+        .format("csv")
+        .option("quote", "\u0000")
+        .option("escape", "\u0000")
+        .option("mode", "DROPMALFORMED")
+        .option("sep", " ")
+        .schema(pagecountSchema)
+        .csv(rawPagecounts.get.getAbsolutePath)
+        .as[PagecountEntry]
+
+        .filter(_.site.endsWith(".z"))
+        .map(e => PagecountEntry(
+          site = """\.z$""".r.replaceFirstIn(e.site, "wiki"),
+          title = e.title,
+          pageviews = e.pageviews))
+
+      pagecounts
+    }
   }
 
   def getWorkData(spark: SparkSession, data: DataFrame, target: String, exists: Boolean = true): DataFrame = {
