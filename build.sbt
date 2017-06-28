@@ -1,4 +1,4 @@
-name := "RecommendationTranslation"
+name := "ResearchRecommendation"
 
 version := "1.0"
 
