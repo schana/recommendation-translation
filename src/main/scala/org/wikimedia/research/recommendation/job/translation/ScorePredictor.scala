@@ -19,6 +19,7 @@ object ScorePredictor {
                     featureData: DataFrame): Unit = {
     log.info("Scoring items")
 
+    spark.sparkContext.setCheckpointDir("/tmp")
     val predictions: Array[DataFrame] = sites.map(target => {
       try {
         log.info("Scoring for " + target)
@@ -28,12 +29,12 @@ object ScorePredictor {
         val model = RandomForestRegressionModel.load(
           new File(modelsInputDir, target).getAbsolutePath)
         log.info("Scoring data for " + target)
-        val predictions = model
+        val targetPredictions = model
           .setPredictionCol(target)
           .transform(workData)
           .select("id", target)
 
-        predictions
+        targetPredictions.checkpoint()
       } catch {
         case unknown: Throwable =>
           log.error("Score for " + target + " failed", unknown)
@@ -44,7 +45,14 @@ object ScorePredictor {
       }
     }).toArray
 
-    val predictedScores = predictions.reduce((left, right) => left.join(right, Seq("id"), "outer"))
+    log.info("Aggregating predictions")
+    val schema = StructType(Seq(
+      StructField("id", StringType, nullable = false)))
+    var predictedScores = spark.createDataFrame(spark.sparkContext.emptyRDD[Row], schema)
+    predictions.foreach(prediction =>
+      predictedScores = predictedScores.join(prediction, Seq("id"), "outer").checkpoint()
+    )
+    predictedScores.show(5)
 
     log.info("Saving predictions")
     predictionsOutputDir.foreach(f = o =>
