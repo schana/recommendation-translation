@@ -4,7 +4,8 @@ import java.io.File
 
 import org.apache.log4j.{LogManager, Logger}
 import org.apache.spark.ml.regression.RandomForestRegressionModel
-import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
+import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
+import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
 
 import scala.collection.parallel.mutable.ParArray
 
@@ -17,7 +18,8 @@ object ScorePredictor {
                     sites: ParArray[String],
                     featureData: DataFrame): Unit = {
     log.info("Scoring items")
-    sites.foreach(target => {
+
+    val predictions: Array[DataFrame] = sites.map(target => {
       try {
         log.info("Scoring for " + target)
         log.info("Getting work data for " + target)
@@ -26,15 +28,31 @@ object ScorePredictor {
         val model = RandomForestRegressionModel.load(
           new File(modelsInputDir, target).getAbsolutePath)
         log.info("Scoring data for " + target)
-        val predictions = model.transform(workData).select("id", Utils.PREDICTION)
+        val predictions = model
+          .setPredictionCol(target)
+          .transform(workData)
+          .select("id", target)
 
-        predictions.show(5)
-        log.info("Saving scores for " + target)
-        predictionsOutputDir.foreach(o =>
-          predictions.write.mode(SaveMode.ErrorIfExists).csv(new File(o, target).getAbsolutePath))
+        predictions
       } catch {
-        case unknown: Throwable => log.error("Score for " + target + " failed", unknown)
+        case unknown: Throwable =>
+          log.error("Score for " + target + " failed", unknown)
+          val schema = StructType(Seq(
+            StructField("id", StringType, nullable = false),
+            StructField(target, DoubleType, nullable = true)))
+          spark.createDataFrame(spark.sparkContext.emptyRDD[Row], schema)
       }
-    })
+    }).toArray
+
+    val predictedScores = predictions.reduce((left, right) => left.join(right, Seq("id"), "outer"))
+
+    log.info("Saving predictions")
+    predictionsOutputDir.foreach(f = o =>
+      predictedScores.coalesce(1)
+        .write
+        .mode(SaveMode.ErrorIfExists)
+        .option("header", value = true)
+        .option("compression", "bzip2")
+        .csv(new File(o, "allPredictions").getAbsolutePath))
   }
 }

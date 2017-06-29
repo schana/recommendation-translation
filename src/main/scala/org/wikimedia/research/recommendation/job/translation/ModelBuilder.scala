@@ -21,13 +21,15 @@ object ModelBuilder {
         log.info("Getting work data for " + target)
         val workData: DataFrame = Utils.getWorkData(spark, featureData, target)
         val Array(trainingData, testData) = workData.randomSplit(Array(0.7, 0.3))
+
         log.info("Training model for " + target)
         val model = Utils.REGRESSOR.fit(trainingData)
+
         log.info("Writing model to file for " + target)
         modelsOutputDir.foreach(o => model.write.save(new File(o, target).getAbsolutePath))
+
         log.info("Testing model for " + target)
         val predictions = model.transform(testData)
-        predictions.show(5)
         val rmse = Utils.EVALUATOR.evaluate(predictions)
         log.info("Root Mean Squared Error (RMSE) on test data for " + target + " = " + rmse)
       } catch {
